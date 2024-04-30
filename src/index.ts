@@ -1,33 +1,75 @@
-/**
- * Welcome to Cloudflare Workers!
- *
- * This is a template for a Scheduled Worker: a Worker that can run on a
- * configurable interval:
- * https://developers.cloudflare.com/workers/platform/triggers/cron-triggers/
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.toml`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import ical from 'node-ical';
+
+type Env = {
+	CALENDER_URL: string;
+	WEBHOOK_URL: string;
+};
 
 export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		await this.scheduled({} as ScheduledEvent, env, ctx);
+		return new Response('OK');
+	},
 	// The scheduled handler is invoked at the interval set in our wrangler.toml's
 	// [[triggers]] configuration.
 	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-		// A Cron Trigger can make requests to other endpoints on the Internet,
-		// publish to a Queue, query a D1 Database, and much more.
-		//
-		// We'll keep it simple and make an API call to a Cloudflare API:
-		let resp = await fetch('https://api.cloudflare.com/client/v4/ips');
-		let wasSuccessful = resp.ok ? 'success' : 'fail';
+		const icsContent = await fetch(env.CALENDER_URL).then((res) => res.text()); //env.CALENDER_URL;
+		const data = ical.parseICS(icsContent);
 
-		// You could store this result in KV, write to a D1 Database, or publish to a Queue.
-		// In this template, we'll just log the result:
-		console.log(`trigger fired at ${event.cron}: ${wasSuccessful}`);
+		// Filter events that are happening today, including multi-day events
+		const today = new Date(new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Taipei' }));
+
+		const events = Object.values(data).filter((ev: any) => {
+			if (ev.type == 'VEVENT') {
+				const start = new Date(new Date(ev.start).toLocaleDateString('en-US', { timeZone: 'Asia/Taipei' }));
+				const end = new Date(new Date(ev.end || ev.start).toLocaleDateString('en-US', { timeZone: 'Asia/Taipei' }));
+
+				return start <= new Date(today) && end >= new Date(today);
+			}
+		});
+
+		if (events.length === 0) {
+			return;
+		}
+
+		// Send a Discord webhook for each event
+		const embeds = events.map((ev: any) => {
+			const start: Date = ev.start;
+			const end: Date = ev.end || start;
+
+			const time = `<t:${Math.floor(start.getTime() / 1000)}:F> - <t:${Math.floor(end.getTime() / 1000)}:F>`;
+			const location = ev.location || '世界的某個角落';
+
+			return {
+				title: ev.summary,
+				description: '',
+				fields: [
+					{
+						name: '⏰️時間',
+						value: time,
+						inline: true,
+					},
+					{
+						name: '📍地點',
+						value: location,
+						inline: true,
+					},
+				],
+				footer: {
+					text: '黑客社行事曆',
+				},
+			};
+		});
+
+		await fetch(env.WEBHOOK_URL, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				content: `${events.map((ev: any) => ev.summary).join('、')}`,
+				embeds,
+			}),
+		});
 	},
 };
